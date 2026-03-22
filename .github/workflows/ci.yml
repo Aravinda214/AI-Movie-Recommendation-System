@@ -1,0 +1,180 @@
+name: CI Pipeline - Movie Recommender
+
+on:
+  push:
+    branches: [ offline_integration_final ]
+  pull_request:
+    branches: [  ]
+
+jobs:
+  # 1️⃣ Test the pipeline
+  test-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -r movie_recommendation_system/requirements.txt
+          pip install pytest
+
+      - name: Run pipeline tests
+        run: pytest movie_recommendation_system/test_pipeline.py -v
+
+  # 2️⃣ Build the pipeline and generate model
+  build-pipeline:
+    runs-on: ubuntu-latest
+    needs: test-pipeline
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install requirements + gdown
+        run: |
+          pip install -r movie_recommendation_system/requirements.txt
+          pip install gdown
+
+      - name: Download data and baseline_data folders from Google Drive (and flatten)
+        run: |
+          echo "📥 Downloading data folders from Google Drive..."
+          mkdir -p movie_recommendation_system
+
+          # Download shared Drive folder (may create nested folders)
+          gdown --folder "https://drive.google.com/drive/folders/1ItDAw0By1W5wqD4ALxUBsg4ohyvCRG3-?usp=sharing" -O movie_recommendation_system/
+
+          echo "📁 Before flattening (some nested folders may exist):"
+          find movie_recommendation_system -maxdepth 3 -type d -print || true
+
+          ROOT="movie_recommendation_system"
+
+          # Move data if nested under CI_PIPELINE_DATA/data
+          if [ -d "$ROOT/CI_PIPELINE_DATA/data" ]; then
+            mv "$ROOT/CI_PIPELINE_DATA/data" "$ROOT/data"
+          fi
+
+          # Flatten data/data -> data/
+          if [ -d "$ROOT/data/data" ]; then
+            mv "$ROOT/data/data/"* "$ROOT/data/" || true
+            rm -rf "$ROOT/data/data"
+          fi
+
+          # Move baseline_data if nested under CI_PIPELINE_DATA/baseline_data
+          if [ -d "$ROOT/CI_PIPELINE_DATA/baseline_data" ]; then
+            mv "$ROOT/CI_PIPELINE_DATA/baseline_data" "$ROOT/baseline_data"
+          fi
+
+          # Flatten baseline_data/baseline_data -> baseline_data/
+          if [ -d "$ROOT/baseline_data/baseline_data" ]; then
+            mv "$ROOT/baseline_data/baseline_data/"* "$ROOT/baseline_data/" || true
+            rm -rf "$ROOT/baseline_data/baseline_data"
+          fi
+
+          # Clean up wrapper if present
+          rm -rf "$ROOT/CI_PIPELINE_DATA" || true
+
+          echo "✅ Final flattened structure (top-level files):"
+          find movie_recommendation_system -maxdepth 2 -type f -print || true
+
+      - name: Run main pipeline (build model)
+        run: python movie_recommendation_system/main_pipeline.py
+
+      - name: Debug - list repo root & model path
+        run: |
+          echo "---- repo root files ----"
+          ls -la
+          echo "---- check models/ ----"
+          ls -la models || true
+
+      - name: Upload model as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: svd-model
+          path: models/svd_model_final.pkl
+
+  # 3️⃣ Copy SVD model to inference service
+  copy-model:
+    runs-on: ubuntu-latest
+    needs: build-pipeline
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download model artifact into Inference Service/models
+        uses: actions/download-artifact@v4
+        with:
+          name: svd-model
+          path: "Inference Service/models"
+
+      - name: List models in Inference Service
+        run: ls -lah "Inference Service/models" || true
+
+  # 4️⃣ Run service tests
+  test-service:
+    runs-on: ubuntu-latest
+    needs: copy-model
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download model artifact into Inference Service/models
+        uses: actions/download-artifact@v4
+        with:
+          name: svd-model
+          path: "Inference Service/models"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install service dependencies
+        run: |
+          pip install -r "Inference Service/requirements.txt"
+          pip install pytest
+
+      - name: Run service tests
+        run: pytest "Inference Service/test_service.py" -v
+
+  # 5️⃣ Build Docker image and push to registry
+  build-and-push-docker:
+    runs-on: ubuntu-latest
+    needs: test-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: svd-model
+          path: "Inference Service/models"
+
+      - name: Install gdown
+        run: pip install gdown
+
+      - name: Download ALS model file
+        run: |
+          mkdir -p "Inference Service/models"
+          file_id="1OUNhFCKvcT8aBq-xvxBA7LNkCQIZtIDX"
+          gdown --fuzzy "https://drive.google.com/uc?id=${file_id}" -O "Inference Service/models/als_bundle.pkl"
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        run: |
+          TAG="v2-$(date +'%Y%m%d%H%M')"
+          docker build -t kmonish72/svd-recommender:${TAG} "Inference Service"
+          docker push kmonish72/svd-recommender:${TAG}
